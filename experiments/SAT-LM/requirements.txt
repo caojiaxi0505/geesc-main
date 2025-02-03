@@ -1,0 +1,11 @@
+openai==0.27.8
+transformers==4.24.0
+tree_sitter
+sqlparse
+pandas
+func_timeout
+scipy
+z3-solver
+lumpy
+tqdm
+matplotlib
