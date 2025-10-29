@@ -1,0 +1,6 @@
+python -m experiments.geesc.launch.cot --base_url http://localhost:8000/v1 --api_key any --model qwen3-8b --dataset gsm8k --dataset_path datasets/gsm8k/test.jsonl
+python -m experiments.geesc.launch.cot --base_url http://localhost:8000/v1 --api_key any --model qwen3-8b --dataset math --dataset_path datasets/math500/test.jsonl --max_tokens 1024
+python -m experiments.geesc.launch.cot --base_url http://localhost:8001/v1 --api_key any --model qwen3-4b --dataset gsm8k --dataset_path datasets/gsm8k/test.jsonl
+python -m experiments.geesc.launch.cot --base_url http://localhost:8001/v1 --api_key any --model qwen3-4b --dataset math --dataset_path datasets/math500/test.jsonl --max_tokens 1024
+python -m experiments.geesc.launch.cot --base_url http://localhost:8002/v1 --api_key any --model qwen3-1.7b --dataset gsm8k --dataset_path datasets/gsm8k/test.jsonl
+python -m experiments.geesc.launch.cot --base_url http://localhost:8002/v1 --api_key any --model qwen3-1.7b --dataset math --dataset_path datasets/math500/test.jsonl --max_tokens 1024
