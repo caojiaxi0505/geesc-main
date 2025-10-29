@@ -1,4 +1,3 @@
-
 import os
 import re
 import json
@@ -6,18 +5,22 @@ import math
 import time
 import argparse
 import logging
-from tqdm import tqdm
+import asyncio
+from tqdm.asyncio import tqdm
 from dataclasses import dataclass, asdict, field
 from typing import List, Dict, Any, Optional, Tuple
 from collections import Counter
 
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 from experiments.geesc.utils.extract_answer import extract_gsm8k_answer
 from experiments.geesc.utils.dataset_loader import GEESCDataset, load_gsm8k, load_math, load_logiqa, load_reclor, load_ruletaker
 from experiments.geesc.utils.math_equivalence import is_equiv
 
 def build_client(base_url: str, api_key: str) -> OpenAI:
     return OpenAI(base_url=base_url, api_key=api_key)
+
+def build_async_client(base_url: str, api_key: str) -> AsyncOpenAI:
+    return AsyncOpenAI(base_url=base_url, api_key=api_key)
 
 def ensure_dir(p: str):
     Path = __import__("pathlib").Path
@@ -151,9 +154,9 @@ def arithmetic_sanity(prefix: str) -> bool:
             return False
     return True
 
-def llm_json_score(client: OpenAI, model: str, system: str, user: str, max_tokens: int = 128, temperature: float = 0.0) -> Dict[str, Any]:
+async def llm_json_score(client: AsyncOpenAI, model: str, system: str, user: str, max_tokens: int = 128, temperature: float = 0.0) -> Dict[str, Any]:
     try:
-        resp = client.chat.completions.create(
+        resp = await client.chat.completions.create(
             model=model,
             messages=[{"role":"system","content":system},{"role":"user","content":user}],
             temperature=temperature,
@@ -179,16 +182,17 @@ class PrefixRecord:
     corrected_text: Optional[str] = None
     rationales: Dict[str, str] = field(default_factory=dict)
 
-def filter_and_correct_prefix(client: OpenAI, model: str, question: str, prefix: str, retrieved: List[Dict[str, Any]]):
+async def filter_and_correct_prefix(client: AsyncOpenAI, model: str, question: str, prefix: str, retrieved: List[Dict[str, Any]]):
     sys1 = "You are a strict judge. Score how coherent and on-topic the given reasoning prefix is for the question. Return JSON with fields: coherence (0-1, float), reason (short)."
     user1 = f"Question:\n{question}\n\nPrefix:\n{prefix}\n\nReturn JSON only."
-    score = llm_json_score(client, model, sys1, user1) or {}
-    coherence = float(score.get("coherence", 0.0))
-    r1 = str(score.get("reason", ""))
     ev_txt = "\n\n".join([f"[Doc {i+1} | score={doc.get('score',0):.3f}]\n{doc.get('text','')}" for i, doc in enumerate(retrieved)]).strip()
     sys2 = "You verify factual claims using the provided evidence snippets. Return JSON with fields: verified (0-1), verdict ('pass'|'fail'|'fixable'), rationale (short), correction (string or null)."
     user2 = f"Question:\n{question}\n\nPrefix:\n{prefix}\n\nEvidence:\n{ev_txt if ev_txt else '(no evidence)'}\n\nReturn JSON only."
-    ver = llm_json_score(client, model, sys2, user2) or {}
+    score_task = llm_json_score(client, model, sys1, user1)
+    ver_task = llm_json_score(client, model, sys2, user2)
+    score, ver = await asyncio.gather(score_task, ver_task)
+    coherence = float(score.get("coherence", 0.0))
+    r1 = str(score.get("reason", ""))
     verified = float(ver.get("verified", 0.0))
     correction = ver.get("correction", None)
     r2 = str(ver.get("rationale", ""))
@@ -221,7 +225,7 @@ def build_retriever(conf: GEESCConfig):
         return FileCorpusRetriever(conf.corpus_path)
     return NullRetriever()
 
-def gen_prefix(client: OpenAI, model: str, question: str, conf: GEESCConfig):
+async def gen_prefix(client: AsyncOpenAI, model: str, question: str, conf: GEESCConfig):
     prompt = (
         f"{question}\n\n"
         "Write only the FIRST concise step of a correct solution.\n"
@@ -229,7 +233,7 @@ def gen_prefix(client: OpenAI, model: str, question: str, conf: GEESCConfig):
         "- Do not give the final answer.\n"
         "- Start your line with 'Step 1:' and keep it under 2 sentences."
     )
-    resp = client.chat.completions.create(
+    resp = await client.chat.completions.create(
         model=model,
         messages=[{"role":"user","content":prompt}],
         temperature=conf.temperature,
@@ -248,7 +252,7 @@ def gen_prefix(client: OpenAI, model: str, question: str, conf: GEESCConfig):
         }
     return prefix, tok
 
-def continue_to_answer(client: OpenAI, model: str, question: str, prefix: str, conf: GEESCConfig):
+async def continue_to_answer(client: AsyncOpenAI, model: str, question: str, prefix: str, conf: GEESCConfig):
     prompt = (
         f"Question:\n{question}\n\n"
         f"You already wrote the first step:\n{prefix}\n\n"
@@ -256,7 +260,7 @@ def continue_to_answer(client: OpenAI, model: str, question: str, prefix: str, c
         "Format your last line exactly as: Final Answer: <answer>\n"
         "Do not include anything after the Final Answer line."
     )
-    resp = client.chat.completions.create(
+    resp = await client.chat.completions.create(
         model=model,
         messages=[{"role":"user","content":prompt}],
         temperature=conf.temperature,
@@ -294,23 +298,25 @@ class GEESCOutputs:
     token_stats: Dict[str, int] = field(default_factory=dict)
     meta: Dict[str, Any] = field(default_factory=dict)
 
-def geesc_single(client: OpenAI, model: str, dataset: str, sample: Dict[str, Any], conf: GEESCConfig, retriever):
+async def geesc_single(client: AsyncOpenAI, model: str, dataset: str, sample: Dict[str, Any], conf: GEESCConfig, retriever):
     q = sample["question"]
     gt = sample.get("gt_answer")
     outputs = GEESCOutputs(question=q, gt_answer=gt, meta={"timestamp": now_iso()})
-    total_prompt_tok = 0
-    total_comp_tok = 0
-    total_tok = 0
-    kept = []
-    prefixes = []
-    for i in range(conf.max_paths):
-        px, tok = gen_prefix(client, model, q, conf)
+    total_prompt_tok, total_comp_tok, total_tok = 0, 0, 0
+    prefix_tasks = [gen_prefix(client, model, q, conf) for _ in range(conf.max_paths)]
+    prefix_results = await asyncio.gather(*prefix_tasks)
+    
+    generated_prefixes = []
+    for px, tok in prefix_results:
+        generated_prefixes.append(px)
         total_prompt_tok += tok.get("prompt_tokens", 0)
         total_comp_tok += tok.get("completion_tokens", 0)
         total_tok += tok.get("total_tokens", 0)
-        docs = retriever.retrieve(q, k=conf.retrieve_k)
-        rec = filter_and_correct_prefix(client, model, q, px, docs)
-        prefixes.append(rec)
+    docs = retriever.retrieve(q, k=conf.retrieve_k)
+    filter_tasks = [filter_and_correct_prefix(client, model, q, px, docs) for px in generated_prefixes]
+    prefixes = await asyncio.gather(*filter_tasks)
+    kept = []
+    for i, rec in enumerate(prefixes):
         good = (rec.coherence >= conf.good_coherence) and (rec.verified >= conf.good_verified)
         if conf.require_arith_ok:
             good = good and rec.arith_ok
@@ -321,125 +327,97 @@ def geesc_single(client: OpenAI, model: str, dataset: str, sample: Dict[str, Any
     if not kept and prefixes:
         best_idx = max(range(len(prefixes)), key=lambda j: prefixes[j].coherence * (0.5 + 0.5*prefixes[j].verified))
         kept = [best_idx]
-    completions = []
-    answers = []
-    for idx in kept:
-        eff = prefixes[idx].corrected_text if prefixes[idx].corrected_text else prefixes[idx].text
-        comp, tok2 = continue_to_answer(client, model, q, eff, conf)
-        completions.append(comp)
-        total_prompt_tok += tok2.get("prompt_tokens", 0)
-        total_comp_tok += tok2.get("completion_tokens", 0)
-        total_tok += tok2.get("total_tokens", 0)
-        answers.append(extract_final_answer_for_dataset(dataset, comp))
+    completions, answers = [], []
+    if kept:
+        continue_tasks = []
+        for idx in kept:
+            eff = prefixes[idx].corrected_text if prefixes[idx].corrected_text else prefixes[idx].text
+            continue_tasks.append(async_continue_to_answer(client, model, q, eff, conf))
+        continue_results = await asyncio.gather(*continue_tasks)
+        for comp, tok2 in continue_results:
+            completions.append(comp)
+            answers.append(extract_final_answer_for_dataset(dataset, comp))
+            total_prompt_tok += tok2.get("prompt_tokens", 0)
+            total_comp_tok += tok2.get("completion_tokens", 0)
+            total_tok += tok2.get("total_tokens", 0)
     maj, votes = majority_vote(answers)
-    if gt is not None:
-        if dataset == "gsm8k":
-            correct = (normalize_ans(str(gt)) == normalize_ans(str(maj)))
-        else:
-            correct = is_equiv(str(maj), str(gt))
-    else:
-        correct = None
-    outputs.prefixes = prefixes
-    outputs.kept_indices = kept
-    outputs.completions = completions
-    outputs.final_answers = answers
-    outputs.votes = votes
-    outputs.majority = maj
-    outputs.correct = correct
-    outputs.token_stats = {
-        "prompt_tokens": total_prompt_tok,
-        "completion_tokens": total_comp_tok,
-        "total_tokens": total_tok,
-    }
+    correct = is_equiv(str(maj), str(gt)) if gt is not None else None
+    outputs.prefixes = prefixes; outputs.kept_indices = kept
+    outputs.completions = completions; outputs.final_answers = answers
+    outputs.votes = votes; outputs.majority = maj; outputs.correct = correct
+    outputs.token_stats = {"prompt_tokens": total_prompt_tok, "completion_tokens": total_comp_tok, "total_tokens": total_tok}
     return outputs
 
-def run():
+async def process_sample(sample, client, model, dataset, conf, retriever, pbar, semaphore):
+    async with semaphore:
+        try:
+            result = await geesc_single(client, model, dataset, sample, conf, retriever)
+        except Exception as e:
+            logging.error(f"Error processing question: {sample.get('question', 'N/A')}. Error: {e}")
+            result = GEESCOutputs(question=sample.get('question', 'N/A'), gt_answer=sample.get('gt_answer'))
+            result.meta["error"] = str(e)
+        pbar.update(1)
+        return result
+
+async def run():
     parser = argparse.ArgumentParser(description="")
     parser.add_argument("--base_url", required=True)
     parser.add_argument("--api_key", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--dataset_path", required=True)
-    # generation budgets
     parser.add_argument("--prefix_tokens", type=int, default=96)
     parser.add_argument("--complete_tokens", type=int, default=256)
-    # adaptive sampling
     parser.add_argument("--max_paths", type=int, default=8)
     parser.add_argument("--early_accept_k", type=int, default=2)
     parser.add_argument("--good_coherence", type=float, default=0.6)
     parser.add_argument("--good_verified", type=float, default=0.4)
     parser.add_argument("--require_arith_ok", action="store_true")
-    # retrieval
     parser.add_argument("--corpus_path", default=None, help="路径指向 .jsonl 或 .txt，单行一文档；jsonl 需包含字段 text。")
     parser.add_argument("--retrieve_k", type=int, default=3)
-    # misc
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top_p", type=float, default=0.8)
     parser.add_argument("--presence_penalty", type=float, default=1.0)
     parser.add_argument("--results_prefix", default=None)
-    args = parser.parse_args()
+    parser.add_argument("--concurrency", type=int, default=8, help="并发请求数量")
+    args = parser.parse_args() 
     conf = GEESCConfig(
-        temperature=args.temperature,
-        top_p=args.top_p,
-        presence_penalty=args.presence_penalty,
-        prefix_tokens=args.prefix_tokens,
-        complete_tokens=args.complete_tokens,
-        max_paths=args.max_paths,
-        early_accept_k=args.early_accept_k,
-        good_coherence=args.good_coherence,
-        good_verified=args.good_verified,
-        require_arith_ok=args.require_arith_ok,
-        corpus_path=args.corpus_path,
-        retrieve_k=args.retrieve_k,
+        temperature=args.temperature, top_p=args.top_p, presence_penalty=args.presence_penalty,
+        prefix_tokens=args.prefix_tokens, complete_tokens=args.complete_tokens, max_paths=args.max_paths,
+        early_accept_k=args.early_accept_k, good_coherence=args.good_coherence,
+        good_verified=args.good_verified, require_arith_ok=args.require_arith_ok,
+        corpus_path=args.corpus_path, retrieve_k=args.retrieve_k,
     )
-    client = build_client(args.base_url, args.api_key)
+    client = build_async_client(args.base_url, args.api_key)
     retriever = build_retriever(conf)
-    if args.dataset == "gsm8k":
-        records = load_gsm8k(args.dataset_path)
-    elif args.dataset == "math":
-        records = load_math(args.dataset_path)
+    if args.dataset == "gsm8k": records = load_gsm8k(args.dataset_path)
+    elif args.dataset == "math": records = load_math(args.dataset_path)
     dataset = GEESCDataset(args.dataset, records)
     results_prefix = args.results_prefix or f"results/geesc_{args.model}_{args.dataset}"
-    content_path = f"{results_prefix}_content.jsonl"
-    token_path = f"{results_prefix}_token.txt"
+    content_path = f"{results_prefix}_content.jsonl"; token_path = f"{results_prefix}_token.txt"
     ensure_dir(content_path); ensure_dir(token_path)
     logging.basicConfig(filename=f'logs/geesc_{args.model}_{args.dataset}.log', level=logging.INFO, encoding='utf-8')
     logging.info("="*200)
-    correct = 0
-    total = 0
+    semaphore = asyncio.Semaphore(args.concurrency)
+    pbar = tqdm(total=len(dataset.records), desc=f"Processing {args.dataset}")
+    tasks = [process_sample(sample, client, args.model, args.dataset, conf, retriever, pbar, semaphore) for sample in dataset.records]
+    all_outputs = await asyncio.gather(*tasks)
+    pbar.close()
+    correct, total = 0, 0
     P_all, C_all, T_all = [], [], []
-    for sample in tqdm(dataset.records, desc=f"Processing {args.dataset}"):
-        out = geesc_single(client, args.model, args.dataset, sample, conf, retriever)
+    for out in all_outputs:
+        if "error" in out.meta: continue
         total += 1
-        if out.correct is True:
-            correct += 1
+        if out.correct is True: correct += 1
         with open(content_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "question": out.question,
-                "gt_answer": out.gt_answer,
-                "prefixes": [asdict(px) for px in out.prefixes],
-                "kept_indices": out.kept_indices,
-                "completions": out.completions,
-                "final_answers": out.final_answers,
-                "votes": out.votes,
-                "majority": out.majority,
-                "correct": out.correct,
-                "meta": out.meta,
-                "token_stats": out.token_stats,
-            }, ensure_ascii=False) + "\n")
+            f.write(json.dumps(asdict(out), ensure_ascii=False) + "\n")
         P = out.token_stats.get("prompt_tokens", 0)
         C = out.token_stats.get("completion_tokens", 0)
         T = out.token_stats.get("total_tokens", 0)
         P_all.append(P); C_all.append(C); T_all.append(T)
-        with open(token_path, "a", encoding="utf-8") as f:
-            f.write(f"{P}, {C}, {T}\n")
-        logging.info(f"Q: {out.question}")
-        logging.info("-"*100)
-        logging.info(f"Kept: {out.kept_indices} | Votes: {out.votes} | Majority: {out.majority} | GT: {out.gt_answer} | Correct: {out.correct}")
-        logging.info(f"Token: Prompt={P} | Completion={C} | Total={T}")
-        logging.info("="*200)
-    def mean(xs): 
-        return sum(xs)/max(1, len(xs))
+        with open(token_path, "a", encoding="utf-8") as f: f.write(f"{P}, {C}, {T}\n")
+        logging.info(f"Q: {out.question}\n" + "-"*100 + f"\nKept: {out.kept_indices} | Votes: {out.votes} | Majority: {out.majority} | GT: {out.gt_answer} | Correct: {out.correct}\n" + f"Token: Prompt={P} | Completion={C} | Total={T}\n" + "="*200)
+    def mean(xs): return sum(xs)/max(1, len(xs))
     acc = (correct / max(1, total)) * 100.0
     print(f"Accuracy on {args.dataset}: {acc:.2f}%  ({correct}/{total})")
     print(f"Avg Prompt Tokens per Q:     {mean(P_all):.2f}")
@@ -447,4 +425,4 @@ def run():
     print(f"Avg Total Tokens per Q:      {mean(T_all):.2f}")
 
 if __name__ == "__main__":
-    run()
+    asyncio.run(run())
